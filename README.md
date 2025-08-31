@@ -3,9 +3,9 @@
 Small benchmark for hidden Markov language modeling.
 
 Features:
-- [] Dense HMM
-- [] Block-sparse HMM
-- [] Low-rank HMM
+- [ ] Dense HMM
+- [ ] Block-sparse HMM
+- [ ] Low-rank HMM
 
 ## What's the point?
 HMMs are not good language models.
