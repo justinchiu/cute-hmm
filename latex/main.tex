@@ -114,6 +114,7 @@ You can speed things up even further with other tricks.
 
 Trick 1: If you make the transition matrix low-rank, you can just do two small matmuls instead of a big one.
 This turns $O(Z^2)$ into $O(ZR)$ with $2R < Z$.
+Random Fourier feature trick, used in linear attention / softmax approximations.
 
 Trick 2: Emission sparsity (words can only be emit in certain states) reduces computation quite a lot.
 It limits the effective state size at any given time.
