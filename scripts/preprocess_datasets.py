@@ -1,11 +1,9 @@
 
-import torchtext
-
 
 def process_file(infile, outfile, sep="<sep>"):
     lines = []
     # replace new lines (except for the ones in-between articles) with sep
-    with open(infile, "r") as f:
+    with open(infile) as f:
         cur_line = []
         for line in f:
             text = line.strip().split()
@@ -17,25 +15,22 @@ def process_file(infile, outfile, sep="<sep>"):
                 cur_line.append(text)
             elif text[0] == "=" and text[1] != "=":
                 # header
-                lines.append(f" {sep} ".join(
-                    " ".join(words) for words in cur_line
-                ))
+                lines.append(f" {sep} ".join(" ".join(words) for words in cur_line))
                 cur_line = [text]
-                #import pdb; pdb.set_trace()
+                # import pdb; pdb.set_trace()
             else:
                 cur_line.append(text)
         # append last line
-        lines.append(f" {sep} ".join(
-            " ".join(words) for words in cur_line
-        ))
+        lines.append(f" {sep} ".join(" ".join(words) for words in cur_line))
 
     with open(outfile, "w") as g:
         g.write("\n".join(lines))
 
+
 def remove_newline(infile, outfile, sep="<eos>"):
     lines = []
     # replace new lines (except for the ones in-between articles) with sep
-    with open(infile, "r") as f:
+    with open(infile) as f:
         for line in f:
             text = line.strip()
             lines.append(text)
@@ -51,7 +46,7 @@ if __name__ == "__main__":
     ]
     outfiles = [f + ".flatarticles" for f in infiles]
 
-    for infile, outfile in zip(infiles, outfiles):
+    for infile, outfile in zip(infiles, outfiles, strict=False):
         process_file(infile, outfile, sep="<eos>")
 
     infiles = [
@@ -61,7 +56,7 @@ if __name__ == "__main__":
     ]
     outfiles = [f + ".flat" for f in infiles]
 
-    for infile, outfile in zip(infiles, outfiles):
+    for infile, outfile in zip(infiles, outfiles, strict=False):
         remove_newline(infile, outfile, sep="<eos>")
 
     infiles = [
@@ -71,6 +66,5 @@ if __name__ == "__main__":
     ]
     outfiles = [f + ".flat" for f in infiles]
 
-    for infile, outfile in zip(infiles, outfiles):
+    for infile, outfile in zip(infiles, outfiles, strict=False):
         remove_newline(infile, outfile, sep="<eos>")
-
