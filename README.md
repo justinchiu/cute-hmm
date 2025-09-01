@@ -42,3 +42,7 @@ python scripts/preprocess_datasets.py
 bash scripts/brown_cluster.sh lm128
 bash scripts/brown_cluster.sh w2flm128
 ```
+
+## SF-compute
+VMs seem broken, but we have the start of a script.
+Kubernetes seems much better supported, unfortunately. Present in same directory.

@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nanogpt
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: nanogpt  # This matches service selector
+    spec:
+      containers:
+      - name: trainer
+        image: justintchiu/nano-diffusion-lm:latest
+        command: ["sh", "-c", "uv run python src/nano_diffusion_lm/cached_fineweb10b.py 8 && uv run torchrun --standalone --nproc_per_node=8 src/cute_hmm/train_gpt.py"]
+        # command: ["torchrun", "--standalone", "--nproc_per_node", "8", "src/cute_hmm/train.py"]
+        ports:
+        - containerPort: 29500
+        resources:
+          requests:
+            nvidia.com/gpu: 8
+            nvidia.com/hostdev: 8
+            memory: "512Gi"
+            cpu: "32"
+          limits:
+            nvidia.com/gpu: 8
+            nvidia.com/hostdev: 8
+            memory: "512Gi"
+            cpu: "32"
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+      volumes:
+      - name: data-volume
+        emptyDir: {}
+      restartPolicy: Never
+
