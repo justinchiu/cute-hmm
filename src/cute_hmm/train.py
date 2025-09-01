@@ -17,17 +17,16 @@ from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 
 import torchtext
-from datasets.lm import PennTreebank
+from datasets.lm import PennTreebank, WikiText2
 from datasets.data import BucketIterator, BPTTIterator
 
 from args import get_args
 
 from utils import set_seed, get_config, get_name, get_mask_lengths
 from utils import Pack
-from utils import plot_counts, print_gpu_mem
+from utils import plot_counts
 
 import wandb
-
 
 valid_schedules = ["reducelronplateau"]
 
@@ -35,13 +34,6 @@ WANDB_STEP = -1
 
 BEST_VALID = -math.inf
 PREV_SAVE = None
-
-def max_diff(log_p):
-    P = log_p.exp()
-    n = P.shape[0]
-    xy = [(x,y) for x in range(n) for y in range(x, n)]
-    diff = th.tensor([(P[x] - P[y]).abs().max() for x,y in xy])
-    print(f"Max diff < 0.01: {(diff < 0.01).sum()} / {diff.shape[0]}")
 
 def update_best_valid(
     valid_losses, valid_n, model, optimizer, scheduler, name,
@@ -73,8 +65,6 @@ def update_best_valid(
 def report(losses, n, prefix, start_time=None):
     loss = losses.evidence
     elbo = losses.elbo
-    # cap loss otherwise overflow
-    #loss = loss if loss > -1e7 else -1e7
     str_list = [
         f"{prefix}: log_prob = {loss:.2f}",
         f"xent(word) = {-loss / n:.2f}",
@@ -121,38 +111,73 @@ def eval_loop(
             n += n_tokens
     return Pack(evidence = total_ll, elbo = total_elbo), n
 
-
-
-def fast_eval_loop(
+def cached_eval_loop(
     args, V, iter, model,
 ):
     total_ll = 0
     total_elbo = 0
     n = 0
-
     with th.no_grad():
         model.train(False)
         lpz = None
         start, transition, emission = model.compute_parameters(model.word2state)
+        word2state = model.word2state
+        for i, batch in enumerate(iter):
+            if hasattr(model, "noise_scale"):
+                model.noise_scale = 0
 
-        if hasattr(model, "temp"):
-            print(f"Model temp {model.temp.item():.2f}")
+            text = batch.text
 
-        # entropy
-        # assert that transition and emission are well-formed
-        myt = model.transition(print_max=True)
-        #myt = model.transition()
-        bigt = myt.logsumexp(-1).abs().max()
-        assert bigt < 1e-4, f"{bigt}"
-        bige = emission.logsumexp(-1).abs().max()
-        assert bige < 1e-4, f"{bige}"
-        # log entropy of transition and emission
+            mask, lengths, n_tokens = get_mask_lengths(text, V)
+            N, T = text.shape
 
-        He = -(emission.exp() * emission).sum()
-        Ht = -(myt.exp() * myt).sum()
-        print(f"Total transition entropy {Ht:.2f} || Total emission entropy {He.sum():.2f}")
+            if lpz is not None and args.iterator == "bptt":
+                start = (lpz[:,:,None] + transition[last_states,:]).logsumexp(1)
 
+            log_potentials = model.clamp(text, start, transition, emission, word2state)
+            losses, lpz = model.compute_loss(log_potentials, mask, lengths)
 
+            if word2state is not None:
+                idx = th.arange(N, device=model.device)
+                last_words = text[idx, lengths-1]
+                last_states = model.word2state[last_words]
+
+            total_ll += losses.evidence.detach()
+            if losses.elbo is not None:
+                total_elbo += losses.elbo.detach()
+            n += n_tokens
+    return Pack(evidence = total_ll, elbo = total_elbo), n
+
+def mixed_cached_eval_loop(
+    args, V, iter, model,
+):
+    total_ll = 0
+    total_elbo = 0
+    n = 0
+    with th.no_grad():
+        model.train(False)
+        lpz = None
+
+        start = model.start().cpu()
+        emission = model.mask_emission(model.emission_logits(), model.word2state).cpu()
+
+        # blocked transition
+        num_blocks = 128
+        block_size = model.C // num_blocks
+        next_state_proj = (model.next_state_proj.weight
+            if hasattr(model, "next_state_proj")
+            else model.next_state_emb()
+        )
+        transition = th.empty(model.C, model.C, device=th.device("cpu"), dtype=emission.dtype)
+        for s in range(0, model.C, block_size):
+            states = range(s, s+block_size)
+            x = model.trans_mlp(model.dropout(
+                model.state_emb.weight[states]
+                if hasattr(model.state_emb, "weight")
+                else model.state_emb(th.LongTensor(states).to(model.device))
+            ))
+            y = (x @ next_state_proj.t()).log_softmax(-1)
+            transition[states] = y.to(transition.device)
 
         word2state = model.word2state
         for i, batch in enumerate(iter):
@@ -165,55 +190,25 @@ def fast_eval_loop(
             N, T = text.shape
 
             if lpz is not None and args.iterator == "bptt":
-                #start = (lpz[:,:,None] + transition[last_states,:]).logsumexp(1)
-                raise NotImplementedError()
+                # hopefully this isn't too slow on cpu
+                start = (lpz[:,:,None] + transition[last_states,:]).logsumexp(1)
 
-            losses, lpz = model.compute_loss(
-                text, start, transition, emission, word2state,
-                mask=mask, lengths=lengths)
+            log_potentials = model.clamp(
+                text, start, transition, emission, word2state
+            ).to(model.device)
 
-            if word2state is not None:
-                idx = th.arange(N, device=model.device)
-                last_words = text[idx, lengths-1]
-                last_states = model.word2state[last_words]
+            losses, lpz = model.compute_loss(log_potentials, mask, lengths)
+            lpz = lpz.cpu()
+
+            idx = th.arange(N, device=model.device)
+            last_words = text[idx, lengths-1]
+            last_states = model.word2state[last_words]
 
             total_ll += losses.evidence.detach()
             if losses.elbo is not None:
                 total_elbo += losses.elbo.detach()
             n += n_tokens
-
     return Pack(evidence = total_ll, elbo = total_elbo), n
-
-def collect_counts_loop(
-    args, V, iter, model,
-):
-    from models.analysis_utils import CountCollector
-    count_collector = CountCollector(model)
-
-    model.train(False)
-    lpz = None
-
-    word2state = model.word2state
-    for i, batch in enumerate(iter):
-        if hasattr(model, "noise_scale"):
-            model.noise_scale = 0
-
-        text = batch.text
-
-        mask, lengths, n_tokens = get_mask_lengths(text, V)
-        N, T = text.shape
-
-        if lpz is not None and args.iterator == "bptt":
-            #start = (lpz[:,:,None] + transition[last_states,:]).logsumexp(1)
-            raise NotImplementedError()
-
-        if word2state is not None:
-            idx = th.arange(N, device=model.device)
-            last_words = text[idx, lengths-1]
-            last_states = model.word2state[last_words]
-
-        count_collector.collect_counts(text, mask, lengths)
-    return count_collector
 
 def train_loop(
     args, V, iter, model,
@@ -223,6 +218,7 @@ def train_loop(
 ):
     global WANDB_STEP
 
+    noise_scales = np.linspace(1, 0, args.noise_anneal_steps)
     total_ll = 0
     total_elbo = 0
     n = 0
@@ -236,22 +232,28 @@ def train_loop(
             WANDB_STEP += 1
             optimizer.zero_grad()
 
-            text = batch.text
+            text = batch.textp1 if "lstm" in args.model else batch.text
             if args.iterator == "bucket":
                 lpz = None
                 last_states = None
+
+            # set noise scale
+            if hasattr(model, "noise_scale"):
+                noise_scale = noise_scales[
+                    min(WANDB_STEP, args.noise_anneal_steps-1)
+                ] if args.noise_anneal_steps > 0 else model.init_noise_scale
+                model.noise_scale = noise_scale
+                wandb.log({
+                    "noise_scale": noise_scale,
+                }, step=WANDB_STEP)
 
             mask, lengths, n_tokens = get_mask_lengths(text, V)
             if model.timing:
                 start_forward = timep.time()
 
-
-            if hasattr(args, "eff") and args.eff:
-                losses, _, _= model.score_rff(
-                    text, lpz=lpz, last_states=last_states, mask=mask, lengths=lengths)
-            else:
-                losses, lpz, last_states = model.score(
-                    text, lpz=lpz, last_states=last_states, mask=mask, lengths=lengths)
+            # check if iterator == bptt
+            losses, lpz, last_states = model.score(
+                text, lpz=lpz, last_states=last_states, mask=mask, lengths=lengths)
 
             if model.timing:
                 print(f"forward time: {timep.time() - start_forward}")
@@ -264,27 +266,16 @@ def train_loop(
             if model.timing:
                 start_backward = timep.time()
             loss.backward()
-
             if model.timing:
                 print(f"backward time: {timep.time() - start_backward}")
-            gradnorm = clip_grad_norm_(parameters, args.clip)
+            clip_grad_norm_(parameters, args.clip)
             if args.schedule not in valid_schedules:
-                # sched before opt since we want step = 1?
-                # this is how huggingface does it
                 scheduler.step()
             optimizer.step()
             wandb.log({
                 "running_training_loss": total_ll / n,
                 "running_training_ppl": math.exp(min(-total_ll / n, 700)),
-                "running_training_elbo": total_elbo / n,
-                "gradnorm": gradnorm,
             }, step=WANDB_STEP)
-            if model.timing:
-                print_gpu_mem()
-
-            if model.timing:
-                print(f"gradnorm {i}: {gradnorm} || sur {loss} || ev {losses.evidence}")
-                import pdb; pdb.set_trace()
 
             if verbose and i % args.report_every == args.report_every - 1:
                 report(
@@ -295,7 +286,15 @@ def train_loop(
 
             if valid_iter is not None and i % checkpoint == checkpoint-1:
                 v_start_time = time.time()
-                eval_fn = fast_eval_loop
+                if args.model == "mshmm" or args.model == "factoredhmm":
+                    if args.num_classes > 2 ** 15:
+                        eval_fn = mixed_cached_eval_loop
+                    else:
+                        eval_fn = cached_eval_loop
+                elif args.model == "hmm":
+                    eval_fn = cached_eval_loop
+                else:
+                    eval_fn = eval_loop
                 valid_losses, valid_n  = eval_fn(
                     args, V, valid_iter, model,
                 )
@@ -313,6 +312,20 @@ def train_loop(
                 }, step=WANDB_STEP)
                 scheduler.step(valid_losses.evidence)
 
+                if args.log_counts > 0 and args.keep_counts > 0:
+                    counts = (model.counts / model.counts.sum(0, keepdim=True))[:,4:]
+                    c, v = counts.shape
+                    cg2 = counts > 1e-2
+
+                    wandb.log({
+                        "avgcounts@1e-2": cg2.sum().item() / float(v),
+                        "maxcounts@1e-2": cg2.sum(0).max().item(),
+                        "mincounts@1e-2": cg2.sum(0).min().item(),
+                        "maxcounts": counts.sum(0).max().item(),
+                        "mincounts": counts.sum(0).min().item(),
+                    }, step=WANDB_STEP)
+                    del cg2
+                    del counts
 
     return Pack(evidence = total_ll, elbo = total_elbo), n
 
@@ -320,6 +333,7 @@ def train_loop(
 def main():
     global WANDB_STEP
     args = get_args()
+    print(args)
 
     set_seed(args.seed)
 
@@ -330,7 +344,10 @@ def main():
 
     TEXT = torchtext.data.Field(batch_first = True)
 
-    Dataset = PennTreebank
+    if args.dataset == "ptb":
+        Dataset = PennTreebank
+    elif args.dataset == "wikitext2":
+        Dataset = WikiText2
 
     train, valid, test = Dataset.splits(
         TEXT,
@@ -369,62 +386,34 @@ def main():
 
     name = get_name(args)
     import tempfile
-    wandb.init(project="linear-hmm", name=name, config=args, dir=tempfile.mkdtemp())
+    wandb.init(project="hmm-lm", name=name, config=args, dir=tempfile.mkdtemp())
     args.name = name
 
-    print(" ".join(sys.argv))
-    print(args)
-
     model = None
-    if args.model == "blhmm":
-        from models.blhmmlm import BLHmmLm
-        model = BLHmmLm(V, args)
-    elif args.model == "bandedhmm":
-        from models.banded_hmmlm import BandedHmmLm
-        model = BandedHmmLm(V, args)
-    elif args.model == "sblhmm":
-        from models.sblhmmlm import SblHmmLm
-        model = SblHmmLm(V, args)
-    else:
-        raise ValueError("Invalid model type")
+    from models.factoredhmmlm import FactoredHmmLm
+    model = FactoredHmmLm(V, args)
     model.to(device)
     print(model)
     num_params, num_trainable_params = count_params(model)
     print(f"Num params, trainable: {num_params:,}, {num_trainable_params:,}")
     wandb.run.summary["num_params"] = num_params
 
-    # load frozen transition
-    if args.frozen_pretrained_transition is not None:
-        past_chp = th.load(args.frozen_pretrained_transition)
-        from models.sblhmmlm import SblHmmLm
-        past_model = SblHmmLm(V, past_chp["args"])
-        past_model.load_state_dict(past_chp["model"])
-        transition = past_model.transition().detach().clone()
-        model.set_frozen_transition(transition)
-        # cleanup
-        del past_model
-        del past_chp
-
     if args.eval_only:
-        # make sure this is uncommented
-        if args.eval_only != "none":
-            model.load_state_dict(th.load(args.eval_only)["model"])
-        from utils import dump_transition, dump_svd
-        dump_transition(model)
-        dump_svd(model)
-
+        model.load_state_dict(th.load(args.eval_only)["model"])
         v_start_time = time.time()
-        eval_fn = fast_eval_loop
+        if args.model == "mshmm" or args.model == "factoredhmm":
+            if args.num_classes > 2 ** 15:
+                eval_fn = mixed_cached_eval_loop
+            else:
+                eval_fn = cached_eval_loop
+        elif args.model == "hmm":
+            eval_fn = cached_eval_loop
+        else:
+            eval_fn = eval_loop
         valid_losses, valid_n = eval_fn(
             args, V, valid_iter, model,
         )
         report(valid_losses, valid_n, f"Valid perf", v_start_time)
-
-        # count states
-        valid_counts = collect_counts_loop(
-            args, V, valid_iter, model,
-        )
-        valid_counts.print_counts()
 
         t_start_time = time.time()
         test_losses, test_n = eval_fn(
@@ -433,7 +422,6 @@ def main():
         report(test_losses, test_n, f"Test perf", t_start_time)
 
         sys.exit()
-        # EXIT FROM EVAL_ONLY
 
     parameters = list(model.parameters())
     if args.optimizer == "adamw":
@@ -470,7 +458,6 @@ def main():
     else:
         raise ValueError("Invalid schedule options")
 
-    # training loop, factor out later if necessary
     for e in range(args.num_epochs):
         start_time = time.time()
         if args.log_counts > 0 and args.keep_counts > 0:
@@ -485,7 +472,15 @@ def main():
         total_time = report(train_losses, train_n, f"Train epoch {e}", start_time)
 
         v_start_time = time.time()
-        eval_fn = fast_eval_loop
+        if args.model == "mshmm" or args.model == "factoredhmm":
+            if args.num_classes > 2 ** 15:
+                eval_fn = mixed_cached_eval_loop
+            else:
+                eval_fn = cached_eval_loop
+        elif args.model == "hmm":
+            eval_fn = cached_eval_loop
+        else:
+            eval_fn = eval_loop
         valid_losses, valid_n  = eval_fn(args, V, valid_iter, model)
         report(valid_losses, valid_n, f"Valid epoch {e}", v_start_time)
 
@@ -506,6 +501,37 @@ def main():
             "best_valid_ppl": math.exp(-BEST_VALID / valid_n),
             "epoch": e,
         }, step=WANDB_STEP)
+
+        if args.log_counts > 0 and args.keep_counts > 0:
+            counts = (model.counts / model.counts.sum(0, keepdim=True))[:,4:]
+            c, v = counts.shape
+            cg2 = counts > 1e-2
+
+            # state counts
+            # log these once per epoch, then set back to zero
+            sc0 = (model.state_counts == 0).sum()
+            sc1 = (model.state_counts == 1).sum()
+            sc2 = (model.state_counts == 2).sum()
+            sc3 = (model.state_counts == 3).sum()
+            sc4 = (model.state_counts == 4).sum()
+            sc5 = (model.state_counts >= 5).sum()
+
+            wandb.log({
+                "avgcounts@1e-2": cg2.sum().item() / float(v),
+                "maxcounts@1e-2": cg2.sum(0).max().item(),
+                "mincounts@1e-2": cg2.sum(0).min().item(),
+                "maxcounts": counts.sum(0).max().item(),
+                "mincounts": counts.sum(0).min().item(),
+
+                "statecounts=0": sc0,
+                "statecounts=1": sc1,
+                "statecounts=2": sc2,
+                "statecounts=3": sc3,
+                "statecounts=4": sc4,
+                "statecounts>=5": sc5,
+            }, step=WANDB_STEP)
+            del cg2
+            del counts
 
     # won't use best model. Rerun with eval_only
     t_start_time = time.time()
