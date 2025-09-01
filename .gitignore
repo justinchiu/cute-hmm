@@ -170,6 +170,28 @@ ehthumbs_vista.db
 .Trash-*
 .nfs*
 
+# LaTeX build files
+*.aux
+*.log
+*.out
+*.toc
+*.pdf
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.blg
+*.bbl
+*.nav
+*.snm
+*.vrb
+*.dvi
+*.ps
+*.lof
+*.lot
+*.idx
+*.ilg
+*.ind
+
 # Project specific
 *.pkl
 *.pickle
